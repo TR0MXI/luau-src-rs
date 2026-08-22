@@ -14,6 +14,7 @@
 #include <string.h>
 
 LUAU_FASTFLAG(LuauDirectFieldGet)
+LUAU_FASTFLAG(LuauGcTraceUdata)
 
 /*
 ** Main thread combines a thread state and the global state
@@ -53,6 +54,16 @@ static void freestack(lua_State* L, lua_State* L1)
     luaM_freearray(L, L1->stack, L1->stacksize, TValue, L1->memcat);
 }
 
+static LuaTable* weakenvalues(lua_State* L, LuaTable* wt)
+{
+    LUAU_ASSERT(FFlag::LuauGcTraceUdata);
+    LuaTable* mt = luaH_new(L, 0, 1);
+    TValue* slot = luaH_setstr(L, mt, L->global->tmname[TM_MODE]);
+    setsvalue(L, slot, luaS_newliteral(L, "v"));
+    wt->metatable = mt;
+    return wt;
+}
+
 /*
 ** open parts that may cause memory-allocation errors
 */
@@ -64,6 +75,11 @@ static void f_luaopen(lua_State* L, void* ud)
     sethvalue(L, registry(L), luaH_new(L, 0, 2)); // registry
     luaS_resize(L, LUA_MINSTRTABSIZE);            // initial size of string table
     luaT_init(L);
+    if (FFlag::LuauGcTraceUdata)
+    {
+        LuaTable* wt = weakenvalues(L, luaH_new(L, 0, 0)); // weakregistry
+        sethvalue(L, &L->global->weakregistry, wt);
+    }
     luaS_fix(luaS_newliteral(L, LUA_MEMERRMSG)); // pin to make sure we can always throw this error
     luaS_fix(luaS_newliteral(L, LUA_ERRERRMSG)); // pin to make sure we can always throw this error
     g->GCthreshold = 4 * g->totalbytes;
@@ -198,11 +214,17 @@ lua_State* lua_newstate(lua_Alloc f, void* ud)
     g->ptrenckey[1] = 0;
     g->ptrenckey[2] = 0;
     g->ptrenckey[3] = 0;
+    for (int i = 0; i < 8; i++)
+        g->ptrenckeynew[i] = 0;
+    g->ptrencactive = 0;
     g->strt.size = 0;
     g->strt.nuse = 0;
     g->strt.hash = NULL;
     setnilvalue(&g->pseudotemp);
     setnilvalue(registry(L));
+    setnilvalue(&g->weakregistry);
+    g->weakregistryfree = 0;
+    g->embeddergc = NULL;
     g->gcstate = GCSpause;
     g->gray = NULL;
     g->grayagain = NULL;
@@ -228,6 +250,7 @@ lua_State* lua_newstate(lua_Alloc f, void* ud)
     for (i = 0; i < LUA_UTAG_LIMIT; i++)
     {
         g->udatagc[i] = NULL;
+        g->udatamark[i] = NULL;
         g->udatamt[i] = NULL;
     }
 
@@ -262,6 +285,9 @@ lua_State* lua_newstate(lua_Alloc f, void* ud)
 
     g->gcstats = GCStats();
     g->lastprotoid = 1;
+
+    g->builtinPcall = NULL;
+    g->builtinXpcall = NULL;
 
 #ifdef LUAI_GCMETRICS
     g->gcmetrics = GCMetrics();
